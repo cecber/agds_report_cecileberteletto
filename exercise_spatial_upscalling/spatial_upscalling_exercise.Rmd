@@ -46,6 +46,9 @@ library(dplyr)
 library(knitr)
 library(skimr)
 
+# Set global seed for full reproducibility
+set.seed(123)
+
 # now the data part:
 # load and prepare the data:
 df <- readr::read_csv("https://raw.githubusercontent.com/geco-bern/leafnp_data/main/data/leafnp_tian_et_al.csv")
@@ -492,6 +495,116 @@ As we saw at the beginning, the datapoints are sparse and unevenly distributed, 
 
 ##Environmental cross-validation (question 2.4)
 ```{r}
+# environmental clustering function (simple one with juat 2 variables)
+environmental_clustering <- function(data, k = 5) {
+  set.seed(42)
+  
+  env_vars <- data %>% 
+    select(map, mat) %>% 
+    drop_na()
+  
+  env_vars_scaled <- scale(env_vars)
+  
+  kmeans_result <- kmeans(env_vars_scaled, centers = k, nstart = 25)
+  
+  data_clean <- data %>% 
+    drop_na(map, mat) %>%
+    mutate(env_cluster = kmeans_result$cluster)
+  
+  return(data_clean)
+}
+
+# Plot environmental clusters
+plot_environmental_clusters <- function(data) {
+  
+  p <- ggplot(data, aes(x = mat, y = map, color = factor(env_cluster))) +
+    geom_point(alpha = 0.6, size = 1) +
+    scale_color_brewer(palette = "Set1", name = "Cluster") +
+    labs(x = "Mean Annual Temperature (°C)", 
+         y = "Mean Annual Precipitation (mm)",
+         title = "Environmental Clusters (K-means, k=5)") +
+    theme_bw() +
+    theme(legend.position = "bottom")
+  
+  return(p)
+}
+
+# Environmental cross-validation function
+environmental_cv <- function(data, k = 5) {
+  
+  # Add environmental clusters
+  data_clustered <- environmental_clustering(data, k = k)
+  
+  # Prepare data
+  data_clean <- data_clustered %>%
+    select(leafN, elv, mat, map, ndep, mai, Species, env_cluster) %>%
+    drop_na()
+  
+  # Create fold indices (same logic as spatial CV)
+  group_folds_train <- map(
+    seq(length(unique(data_clean$env_cluster))),
+    ~ {
+      data_clean %>%
+        select(env_cluster) %>%
+        mutate(idx = row_number()) %>%
+        filter(env_cluster != .x) %>%
+        pull(idx)
+    }
+  )
+  
+  group_folds_test <- map(
+    seq(length(unique(data_clean$env_cluster))),
+    ~ {
+      data_clean %>%
+        select(env_cluster) %>%
+        mutate(idx = row_number()) %>%
+        filter(env_cluster == .x) %>%
+        pull(idx)
+    }
+  )
+  
+  # Function to train and test on each fold
+  train_test_by_fold <- function(idx_train, idx_test) {
+    
+    # Split data
+    train_data <- data_clean[idx_train, ]
+    test_data <- data_clean[idx_test, ]
+    
+    # Prepare predictors and target
+    X_train <- train_data %>% select(-leafN, -env_cluster)
+    y_train <- train_data$leafN
+    X_test <- test_data %>% select(-leafN, -env_cluster)
+    y_test <- test_data$leafN
+    
+    # Train model
+    mod <- ranger(
+      x = X_train,
+      y = y_train,
+      mtry = 3,
+      min.node.size = 12,
+      num.trees = 500
+    )
+    
+    # Predict
+    pred <- predict(mod, data = X_test)$predictions
+    
+    # Calculate metrics
+    metrics <- calc_metrics(y_test, pred)
+    
+    return(metrics)
+  }
+  
+  # Apply function on each fold
+  results <- map2_dfr(
+    group_folds_train,
+    group_folds_test,
+    ~ train_test_by_fold(.x, .y)
+  ) %>%
+    mutate(test_fold = 1:k)
+  
+  return(list(results = results, data = data_clustered))
+}
+
 # 1. Create environmental clusters and visualize them
 leafN_data_env <- environmental_clustering(dfs, k = 5)
 
