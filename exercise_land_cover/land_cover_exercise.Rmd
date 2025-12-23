@@ -1,0 +1,448 @@
+---
+title: "land_cover_exercise"
+autor: "Cécile Bertelletto"
+output: html_document
+---
+# Report - Land-Use and Land-Cover Model Improvement
+
+This report is part of the course Applied GeoData Sciences 2 of the university of Bern and is based on the book a Handfull of Pixels: https://geco-bern.github.io/handfull_of_pixels/land_cover_classification.html. 
+This report implements and evaluates four key improvements to a land cover classification model using MODIS satellite data. 
+The improvements are tested incrementally to demonstrate their individual and combined effects on model performance.
+
+Let's first install/open the packages.
+
+```{r}
+
+# Install packages if not already done
+packages <- c("dplyr", "tidyr", "parsnip", "workflows", "tune", 
+              "dials", "rsample", "caret", "readr", "ggplot2", 
+              "xgboost", "doParallel", "yardstick", "viridis", "vip")
+
+missing_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+if(length(missing_packages)) {
+  install.packages(missing_packages)
+}
+
+# Load required packages
+library(dplyr)
+library(tidyr)
+library(parsnip)
+library(workflows)
+library(tune)
+library(dials)
+library(rsample)
+library(readr)
+library(ggplot2)
+library(xgboost)
+library(doParallel)
+library(yardstick)
+library(viridis)
+library(vip)
+```
+
+
+
+## PART 1: 4 ways to improve the original model
+
+1. more spectral bands 
+ - the original mdoel uses only bands 1-4.
+ - derived spectral indices can be added (like NDVI, EVI). they can be calculated from MODIS bands (implemented, see below).
+ - so all 7 MODIS bands could be used for more spectral information.
+ - we obtain NDVI like this: NDVI = (NIR - Red) / (NIR + Red)
+ - we obtain EVI like this: EVI = 2.5 * ((NIR - Red) / (NIR + 6*Red - 7.5*Blue + 1))
+
+2. tuning of the hyperparameters
+ - the original model only tunes min_n and tree_depth (2 parameters, 3 combinations)
+ - adding learn_rate and loss_reduction would increase to model paramaters to 4 (implemented, see below)
+ - also increasing the grid size to 6-8 combinations for better optimization is an option (not implemented because it was taking way too long)
+
+3. more trees (not implemented in this report)
+ - the original mdoel uses only 50 trees
+ - it's important to mention here that tere is a bakance to find between the model accuracy and the computational cost!
+
+4. better CV strategies (not implemented in this report)
+ - the original model uses only 3-fold CV
+ - using 5-fold could be one option for more robust parameter selection
+ - other CV logic like spatial CV could also be interesing to take into accound the spatial autocorrelation 
+
+## PART 2: implementation of 2 of the improvements
+
+To beginn, we need to ensure for reproducibility and then download the data:
+
+```{r}
+# Set seed for reproducibility
+set.seed(42)
+
+# Create data directory
+if (!dir.exists("data")) {
+  dir.create("data")
+}
+
+# Download training data from Zenodo
+if (!file.exists("data/training_data.rds")) {
+  download.file(
+    url = "https://zenodo.org/records/8298491/files/training_data.rds?download=1",
+    destfile = "data/training_data.rds",
+    mode = "wb"
+  )
+}
+
+# Download test data from Zenodo
+# NOTE: Test data does NOT have LC1 labels - these are held by the leaderboard
+if (!file.exists("data/test_data.rds")) {
+  download.file(
+    url = "https://zenodo.org/records/8298491/files/test_data.rds?download=1",
+    destfile = "data/test_data.rds",
+    mode = "wb"
+  )
+}
+
+# Load data
+training_data <- readr::read_rds("data/training_data.rds")
+test_data <- readr::read_rds("data/test_data.rds")
+```
+
+
+### First improvment implemented - more spectral indices:
+
+In this section we then implement the first improvement consisting of adding derived spectral indices. 
+
+```{r}
+# Function to calculate spectral indices for MODIS data
+add_spectral_indices <- function(df) {
+  # Get band column names (MCD43A4 MODIS format)
+  band_cols <- grep("MCD43A4.*Band", names(df), value = TRUE)
+  
+  # For each date, calculate NDVI, EVI
+  # MODIS bands: 1=Red, 2=NIR, 3=Blue, 7=MIR
+  
+  # Get unique dates from column names
+  dates <- unique(gsub(".*_(\\d{4}-\\d{2}-\\d{2})$", "\\1", band_cols))
+  
+  for (date in dates) {
+    # Identify Red (Band1) and NIR (Band2) columns for this specific date
+    red_col <- grep(paste0("Band1_", date, "$"), names(df), value = TRUE)
+    nir_col <- grep(paste0("Band2_", date, "$"), names(df), value = TRUE)
+    
+    if (length(red_col) > 0 && length(nir_col) > 0) {
+      # Calculate NDVI: (NIR - Red) / (NIR + Red)
+      ndvi_col_name <- paste0("NDVI_", date)
+      df[[ndvi_col_name]] <- (df[[nir_col]] - df[[red_col]]) / 
+                              (df[[nir_col]] + df[[red_col]] + 0.0001)
+      
+      # If we have blue band (Band3), calculate EVI
+      blue_col <- grep(paste0("Band3_", date, "$"), names(df), value = TRUE)
+      if (length(blue_col) > 0) {
+        # EVI = 2.5 * ((NIR - Red) / (NIR + 6*Red - 7.5*Blue + 1))
+        evi_col_name <- paste0("EVI_", date)
+        df[[evi_col_name]] <- 2.5 * ((df[[nir_col]] - df[[red_col]]) / 
+                                     (df[[nir_col]] + 6*df[[red_col]] - 
+                                      7.5*df[[blue_col]] + 1))
+      }
+    }
+  }
+  
+  return(df)
+}
+
+# Add spectral indices to training and test data
+training_data_enhanced <- add_spectral_indices(training_data)
+test_data_enhanced <- add_spectral_indices(test_data)
+
+# Verify indices were created
+print(paste("Created", length(grep("NDVI|EVI", names(training_data_enhanced), value = TRUE)), "spectral index columns"))
+# Count new features
+spectral_cols <- grep("^(NDVI|EVI)_", names(training_data_enhanced), value = TRUE)
+
+# Prepare enhanced training data (remove ID columns)
+train_enhanced <- training_data_enhanced |>
+  select(-c(pixelID, lat, lon))
+
+# Prepare test data (keep pixelID for submission)
+# test <- test_data_enhanced
+```
+
+Now we want to see what we implemented above:
+
+```{r, include=FALSE}
+#vizualize the results from above
+
+# See all new column names
+spectral_cols <- grep("^(NDVI|EVI)_", names(training_data_enhanced), value = TRUE)
+print(spectral_cols)
+
+# Summary statistics of spectral indices
+training_data_enhanced |>
+  select(starts_with("NDVI_") | starts_with("EVI_")) |>
+  summary()
+```
+
+```{r}
+# 1. NDVI Distribution across dates
+p1 <- training_data_enhanced |>
+  select(starts_with("NDVI_")) |>
+  pivot_longer(everything(), names_to = "date", values_to = "NDVI") |>
+  ggplot(aes(x = NDVI, fill = date)) +
+  geom_density(alpha = 0.4) +
+  labs(title = "NDVI Distribution Across Dates",
+       x = "NDVI Value", y = "Density") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# 2. NDVI boxplots by date
+p2 <- training_data_enhanced |>
+  select(starts_with("NDVI_")) |>
+  pivot_longer(everything(), names_to = "date", values_to = "NDVI") |>
+  mutate(date = gsub("NDVI_", "", date)) |>
+  ggplot(aes(x = date, y = NDVI, fill = date)) +
+  geom_boxplot() +
+  labs(title = "NDVI Variation Across Dates",
+       x = "Date", y = "NDVI") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+# 3. NDVI vs EVI relationship
+first_ndvi <- grep("^NDVI_", names(training_data_enhanced), value = TRUE)[1]
+first_evi <- grep("^EVI_", names(training_data_enhanced), value = TRUE)[1]
+
+p3 <- training_data_enhanced |>
+  ggplot(aes(x = .data[[first_ndvi]], y = .data[[first_evi]])) +
+  geom_point(alpha = 0.3, size = 1) +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "NDVI vs EVI Relationship",
+       x = "NDVI", y = "EVI") +
+  theme_minimal()
+
+# 4. Spatial distribution of NDVI
+p4 <- training_data_enhanced |>
+  ggplot(aes(x = lon, y = lat, color = .data[[first_ndvi]])) +
+  geom_point(size = 1.5) +
+  scale_color_viridis_c() +
+  labs(title = "Spatial Distribution of NDVI",
+       x = "Longitude", y = "Latitude",
+       color = "NDVI") +
+  theme_minimal()
+
+# Display plots
+gridExtra::grid.arrange(p1, p2, p3, p4, ncol = 2)
+```
+
+
+#### comments about the plots: 
+NDVI Distribution (on the top-left):
+- The values are concentrated between 0 and 0.5
+- almost normal distribution
+- multiple overlapping density curves indicates temporal consistency
+- we can assume stable vegetation patterns across the time series
+
+NDVI Variation Across Dates (on the top-right):
+- values are quite stable across different observation dates
+- temporal stability is interesting for land cover classification: it suggests that the features capture consistent vegetation characteristics
+
+NDVI vs EVI Relationship (on the bottom-left): 
+- strong positive linear correlation 
+- both indices measure vegetation greenness using similar spectral bands
+- EVI shows more scatter and some extreme values
+
+Spatial Distribution (on the bottom-right):
+- global spatial pattern shows geographic structure in NDVI values
+- higher values (yellow/green) in tropical regions
+- lower values (purple/blue) in arid zones and high latitudes
+- spectral indices successfully capture biome-level differences
+- this might significantly improve land cover classification
+
+
+
+```{r}
+# Time series of mean NDVI
+training_data_enhanced |>
+  select(starts_with("NDVI_")) |>
+  pivot_longer(everything(), names_to = "date", values_to = "NDVI") |>
+  mutate(date = gsub("NDVI_", "", date),
+         date = as.Date(date)) |>
+  group_by(date) |>
+  summarise(mean_NDVI = mean(NDVI, na.rm = TRUE),
+            sd_NDVI = sd(NDVI, na.rm = TRUE),
+            .groups = "drop") |>
+  ggplot(aes(x = date, y = mean_NDVI)) +
+  geom_line(color = "darkgreen", size = 1) +
+  geom_ribbon(aes(ymin = mean_NDVI - sd_NDVI, 
+                  ymax = mean_NDVI + sd_NDVI), 
+              alpha = 0.2, fill = "darkgreen") +
+  labs(title = "Mean NDVI Over Time with Standard Deviation",
+       x = "Date", y = "Mean NDVI") +
+  theme_minimal()
+```
+
+
+#### comments about the plots: 
+We can recognize important seasonal patterns in the vegetation greenness.
+The mean NDVI shows a seasonal cycle with lower values in winter and in spring and with higher value in summer (for the northern hemisphere). 
+
+
+
+### Second improvment implemented - tuning of hyperparameters
+In this section we implement the second improvement that is the tuning of the hyperparameters. 
+```{r}
+# Model specification 
+model_improved_tuning <- parsnip::boost_tree(
+  trees = 50,              
+  min_n = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),     
+  loss_reduction = tune()  
+) |>
+  set_engine("xgboost") |>
+  set_mode("classification")
+
+# Improved workflow with enhanced features
+workflow_improved <- workflows::workflow() |>
+  add_formula(as.factor(LC1) ~ .) |>
+  add_model(model_improved_tuning)
+
+# Improved hyperparameter grid 
+grid_improved <- dials::grid_latin_hypercube(
+  min_n(range = c(5, 30)),
+  tree_depth(range = c(4, 12)),
+  learn_rate(range = c(-2, -0.5), trans = scales::log10_trans()),
+  loss_reduction(range = c(-3, 0), trans = scales::log10_trans()),
+  size = 4  
+)
+
+# Cross-validation 
+folds_improved <- rsample::vfold_cv(train_enhanced, v = 3, strata = LC1) 
+
+print(grid_improved)
+```
+
+
+#### comments about the tables:
+the table above shows the improvement over the baseline model by expanding from 2 to 4 tunable parameters
+By adding learn_rate and loss_reduction the model becomes more complex but it can also be computationally costly!
+
+
+
+```{r, cache=TRUE}
+#before if was just model configuration
+#now we do the mdoel training
+
+# Setup parallel processing
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+
+
+# Tune the improved model
+results_improved <- tune::tune_grid(
+  workflow_improved,
+  resamples = folds_improved,
+  grid = grid_improved,
+  control = tune::control_grid(
+    save_pred = TRUE,
+    verbose = FALSE,
+    allow_par = TRUE
+  ),
+  metrics = yardstick::metric_set(
+    yardstick::accuracy,
+    yardstick::roc_auc,
+    yardstick::kap
+  )
+)
+
+stopCluster(cl)
+
+# show the results
+show_best(results_improved, metric = "roc_auc", n = 5) |> print()
+
+# and select the best parameters
+best_params_improved <- select_best(results_improved, metric = "roc_auc")
+print(best_params_improved)
+
+```
+
+## Model training with implemented improvements
+```{r}
+# Create final model specification with more trees
+model_final <- parsnip::boost_tree(
+  trees = 150,  # Increased trees for final model
+  min_n = best_params_improved$min_n,
+  tree_depth = best_params_improved$tree_depth,
+  learn_rate = best_params_improved$learn_rate,
+  loss_reduction = best_params_improved$loss_reduction
+) |>
+  set_engine("xgboost") |>
+  set_mode("classification")
+
+# Final workflow
+workflow_final <- workflows::workflow() |>
+  add_formula(as.factor(LC1) ~ .) |>
+  add_model(model_final)
+
+# Fit on all training data
+
+final_model_fit <- fit(workflow_final, data = train_enhanced)
+```
+
+```{r}
+# Prepare test data
+test_enhanced <- test_data_enhanced |>
+  select(-any_of(c("pixelID", "lat", "lon", "LC1")))
+
+# Make predictions
+predictions <- predict(final_model_fit, new_data = test_enhanced)
+
+# Check predictions
+table(predictions$.pred_class) |> print()
+```
+```{r}
+# Visualize predicted class distribution
+pred_df <- data.frame(
+  land_cover = predictions$.pred_class
+)
+
+ggplot(pred_df, aes(x = land_cover, fill = land_cover)) +
+  geom_bar() +
+  labs(title = "Predicted Land Cover Class Distribution",
+       x = "Land Cover Type", 
+       y = "Count") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+```
+
+
+#### comment about the plot
+We can see here a quite balanced distribution. 
+
+
+```{r}
+# Extract feature importance from xgboost
+vip(final_model_fit, num_features = 20) +
+  labs(title = "Top 20 - most important features") +
+  theme_minimal()
+```
+
+
+#### comment about the plot
+We see that it was worth it to add the NDVI indices.
+The temporal spread of the represented features also suggests that this approach captures phenological patterns: they help to distinguish different type of vegetation. 
+
+
+###submition of the results
+```{r}
+# Prepare submission file in the exact format required
+submission <- data.frame(
+  lulc_class = predictions$.pred_class
+)
+
+# Save as CSV
+output_file <- "cecber_results.csv"
+readr::write_csv(submission, output_file)
+
+```
+
+
+
+
+
+
