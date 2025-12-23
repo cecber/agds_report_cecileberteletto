@@ -88,7 +88,7 @@ One alternative to euclidian distance would be environmental distance:
 - this is more likely to be more relevant for models based on environmental covariates.
 
 
-##Random cross validation (question 2.2)
+## Random cross validation (question 2.2)
 
 ```{r}
 
@@ -246,7 +246,7 @@ plot_spatial_clusters(leafN_data_clustered)
 
 ```
 
-### comment about the clustering (question 2.3.2):
+#### comments about the clustering (question 2.3.2):
 The points on the map were clustered.
 Here a brief desciption of which points are in which cluster (using color as a reference):
 - organge: North America and Pasific ocean
@@ -281,7 +281,7 @@ plot_leafN_by_cluster(leafN_data_clustered)
 
 ```
 
-### comments about the leaf N cluters (question 2.3.3):
+#### comments about the leaf N cluters (question 2.3.3):
 General comments:
 - median: most of the median values are kind of similar across the clusters, only the red and especailly the violet ones are a bit lower.
 - outliers: all the clusters have quite a lot if points considered to be outlier (according to box-plot definition). Only the violet one show a bit less outliers that the other 4 clusters.

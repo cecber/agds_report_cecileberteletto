@@ -9,14 +9,14 @@ This report is part of the course Applied GeoData Sciences 2 of the university o
 This report implements and evaluates four key improvements to a land cover classification model using MODIS satellite data. 
 The improvements are tested incrementally to demonstrate their individual and combined effects on model performance.
 
-Let's first install/open the packages.
+Let's first install/open the packages/libraries.
 
-```{r}
+```{r, message=FALSE, warning=FALSE}
 
 # Install packages if not already done
 packages <- c("dplyr", "tidyr", "parsnip", "workflows", "tune", 
               "dials", "rsample", "caret", "readr", "ggplot2", 
-              "xgboost", "doParallel", "yardstick", "viridis", "vip")
+              "xgboost", "doParallel", "yardstick", "viridis", "vip", "doRNG")
 
 missing_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
 if(length(missing_packages)) {
@@ -38,6 +38,7 @@ library(doParallel)
 library(yardstick)
 library(viridis)
 library(vip)
+library(doRNG)
 ```
 
 
@@ -65,9 +66,9 @@ library(vip)
  - using 5-fold could be one option for more robust parameter selection
  - other CV logic like spatial CV could also be interesing to take into accound the spatial autocorrelation 
 
-## PART 2: implementation of 2 of the improvements
+## PART 2: Implementation of 2 of the improvements
 
-To beginn, we need to ensure for reproducibility and then download the data:
+To begin, we need to ensure for reproducibility and then download the data:
 
 ```{r}
 # Set seed for reproducibility
@@ -113,10 +114,7 @@ add_spectral_indices <- function(df) {
   # Get band column names (MCD43A4 MODIS format)
   band_cols <- grep("MCD43A4.*Band", names(df), value = TRUE)
   
-  # For each date, calculate NDVI, EVI
-  # MODIS bands: 1=Red, 2=NIR, 3=Blue, 7=MIR
-  
-  # Get unique dates from column names
+  # For each date, calculate NDVI, EVI ; MODIS bands: 1=Red, 2=NIR, 3=Blue, 7=MIR
   dates <- unique(gsub(".*_(\\d{4}-\\d{2}-\\d{2})$", "\\1", band_cols))
   
   for (date in dates) {
@@ -177,7 +175,7 @@ training_data_enhanced |>
   summary()
 ```
 
-```{r}
+```{r, message=FALSE, warning=FALSE}
 # 1. NDVI Distribution across dates
 p1 <- training_data_enhanced |>
   select(starts_with("NDVI_")) |>
@@ -229,28 +227,29 @@ gridExtra::grid.arrange(p1, p2, p3, p4, ncol = 2)
 ```
 
 
+
 #### comments about the plots: 
 NDVI Distribution (on the top-left):
-- The values are concentrated between 0 and 0.5
-- almost normal distribution
-- multiple overlapping density curves indicates temporal consistency
-- we can assume stable vegetation patterns across the time series
+ - The values are concentrated between 0 and 0.5
+ - almost normal distribution
+ - multiple overlapping density curves indicates temporal consistency
+ - we can assume stable vegetation patterns across the time series
 
 NDVI Variation Across Dates (on the top-right):
-- values are quite stable across different observation dates
-- temporal stability is interesting for land cover classification: it suggests that the features capture consistent vegetation characteristics
+ - values are quite stable across different observation dates
+ - temporal stability is interesting for land cover classification: it suggests that the features capture consistent vegetation characteristics
 
 NDVI vs EVI Relationship (on the bottom-left): 
-- strong positive linear correlation 
-- both indices measure vegetation greenness using similar spectral bands
-- EVI shows more scatter and some extreme values
+ - strong positive linear correlation 
+ - both indices measure vegetation greenness using similar spectral bands
+ - EVI shows more scatter and some extreme values
 
 Spatial Distribution (on the bottom-right):
-- global spatial pattern shows geographic structure in NDVI values
-- higher values (yellow/green) in tropical regions
-- lower values (purple/blue) in arid zones and high latitudes
-- spectral indices successfully capture biome-level differences
-- this might significantly improve land cover classification
+ - global spatial pattern shows geographic structure in NDVI values
+ - higher values (yellow/green) in tropical regions
+ - lower values (purple/blue) in arid zones and high latitudes
+ - spectral indices successfully capture biome-level differences
+ - this might significantly improve land cover classification
 
 
 
@@ -327,10 +326,12 @@ By adding learn_rate and loss_reduction the model becomes more complex but it ca
 #before if was just model configuration
 #now we do the mdoel training
 
+set.seed(42)
+registerDoRNG(42) 
+
 # Setup parallel processing
 cl <- makeCluster(detectCores() - 1)
 registerDoParallel(cl)
-
 
 # Tune the improved model
 results_improved <- tune::tune_grid(
@@ -361,7 +362,7 @@ print(best_params_improved)
 ```
 
 ## Model training with implemented improvements
-```{r}
+```{r,cache=TRUE}
 # Create final model specification with more trees
 model_final <- parsnip::boost_tree(
   trees = 150,  # Increased trees for final model
