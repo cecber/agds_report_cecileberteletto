@@ -1,0 +1,720 @@
+---
+title: "Spatial Upscalling"
+autor: "Cécile Bertelletto"
+output: html_document
+---
+
+# Report - Spatial upscalling 
+This report is about the spatial upscalling exercise of the AGDS2 lecture: https://geco-bern.github.io/spatial_upscaling/
+Below, all the steps needed for the realization of the exercise are explained, the results are visualized and interpreted. 
+
+## Let's get started
+
+### Packages and data
+
+In this section we first install and open the needed packages. 
+Then we download/open the data. 
+More exactly we download data from: https://zenodo.org/records/11071944
+Then we extract and load the CSV file.
+We make sure that the data has the following columns, as we'll need them later:
+  - leafN (leaf nitrogen content)
+  - lon, lat (coordinates)
+  - elv, mat, map, ndep, mai (environmental predictors)
+  - Species (plant species)
+  
+```{r, include=FALSE}
+
+#install packages, if not already done:
+packages <- c("tidyverse", "ranger", "sf", "rnaturalearth", 
+              "rnaturalearthdata", "yardstick", "knitr", "skimr")
+
+# Install missing packages:
+missing_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+if(length(missing_packages)) {
+  install.packages(missing_packages)
+}
+
+# Load/open the required libraries:
+library(tidyverse)
+library(ranger)
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(yardstick)
+library(dplyr)
+library(knitr)
+library(skimr)
+
+# Set global seed for full reproducibility
+set.seed(123)
+
+# now the data part:
+# load and prepare the data:
+df <- readr::read_csv("https://raw.githubusercontent.com/geco-bern/leafnp_data/main/data/leafnp_tian_et_al.csv")
+
+#have a look at the data:
+common_species <- df |>
+  group_by(Species) |>
+  summarise(count = n()) |>
+  arrange(desc(count)) |>
+  slice(1:50) |>
+  pull(Species)
+
+dfs <- df |>
+  dplyr::select(leafN, lon, lat, elv, mat, map, ndep, mai, Species) |>
+  filter(Species %in% common_species)
+
+# quick overview of data:
+skimr::skim(dfs)
+
+```
+
+## literature (question 2.1)
+
+### Difference between a random cross-validation and a spatial cross-validation
+The random CV:
+- randomly splits the data into folds, ignoring e.g. the spatial structure of the data available. 
+- as a result, the training sets and the test sets may contain nearby points, and this can potentially have further consequences after.
+
+The spatial CV:
+-groups spatially proximate points together in fold instead of doing it completely randomly as described in the previous paragraph. 
+- as a result it is then possible to tests the model's ability to predict in new geographic regions. 
+
+### Alternative to Euclidian distance
+One alternative to euclidian distance would be environmental distance:
+- we could calculate the distances in environmental space (e.g., MAT, MAP)
+- this allows to directly measures how different the environmental conditions are.
+- this is more likely to be more relevant for models based on environmental covariates.
+
+
+## Random cross validation (question 2.2)
+
+```{r}
+
+# calculate metrics
+calc_metrics <- function(obs, pred) {
+  tibble(
+    rmse = sqrt(mean((obs - pred)^2)),
+    rsq = cor(obs, pred)^2
+  )
+}
+
+# Random cross-validation:
+random_cv <- function(data, n_folds = 5) {
+  
+  # Prepare data:
+  data_clean <- data %>%
+    select(leafN, elv, mat, map, ndep, mai, Species) %>%
+    drop_na()
+  
+  # Create random folds:
+  set.seed(123)  # for reproducibility!
+  #Standard 5-fold CV should assign each data point to exactly one fold:
+  data_clean$fold <- sample(rep(1:n_folds, length.out = nrow(data_clean)))
+  
+  # Perform CV:
+  results <- map_dfr(1:n_folds, function(fold_id) {
+    
+    # Split data:
+    train_data <- data_clean %>% filter(fold != fold_id)
+    test_data <- data_clean %>% filter(fold == fold_id)
+    
+    # Prepare predictors and target:
+    X_train <- train_data %>% select(-leafN, -fold)
+    y_train <- train_data$leafN
+    X_test <- test_data %>% select(-leafN, -fold)
+    y_test <- test_data$leafN
+    
+    # Train model:
+    mod <- ranger(
+      x = X_train,
+      y = y_train,
+      mtry = 3,
+      min.node.size = 12,
+      num.trees = 500
+    )
+    
+    # Predict:
+    pred <- predict(mod, data = X_test)$predictions
+    
+    # Calculate metrics:
+    metrics <- calc_metrics(y_test, pred)
+    metrics$fold <- fold_id
+    
+    return(metrics)
+  })
+  
+  return(results)
+}
+
+results <- random_cv(dfs)
+
+results_summary <- results %>% 
+  summarise(
+    mean_rmse = mean(rmse),
+    mean_rsq = mean(rsq)
+  )
+results_summary
+
+# Print in a nicer way:
+print(paste("Mean RMSE across folds:", round(results_summary$mean_rmse, 3)))
+print(paste("Mean R² across folds:", round(results_summary$mean_rsq, 3)))
+
+```
+### RMSE and R across cross-validation folds:
+From the result above we get a RMSE of 2.348 and R² of 0.789.
+Those values are the ones across the folds, this mean we take the mean of each folds' result for both metrics. 
+
+##Spatial cross validation (question 2.3)
+
+```{r}
+
+
+# Function to visualize geographic distribution
+plot_data_distribution <- function(data) {
+  
+  coast <- ne_coastline(scale = 110, returnclass = "sf")
+  
+  p <- ggplot() +
+    geom_sf(data = coast, colour = "black", size = 0.2) +
+    coord_sf(ylim = c(-60, 80), expand = FALSE) +
+    geom_point(data = data, aes(x = lon, y = lat), 
+               color = "red", size = 0.2, alpha = 0.5) +
+    labs(x = "", y = "", title = "Global Distribution of Leaf N Data") +
+    theme_bw() +
+    theme(legend.position = "bottom")
+  
+  return(p)
+}
+
+#actually see the plot:
+plot_data_distribution(df)
+
+```
+
+### Observations about data distribution (question 2.3.1):
+We can see in the map above that:
+- the data is really concentrated in certain regions (Europe and China);
+- there is a parse coverage in Africa, America (North and South), Asia (exept China), and Australia;
+- the spatial distribution is quite uneven and this may lead to poor predictions in underrepresented regions.
+
+
+```{r}
+# Spatial clustering function
+spatial_clustering <- function(data, k = 5) {
+  
+  # Part 2 - Perform k-means clustering on coordinates
+  set.seed(42)
+  coords <- data %>% 
+    select(lon, lat) %>%
+    drop_na()
+  
+  kmeans_result <- kmeans(coords, centers = k, nstart = 25)
+  
+  data_clean <- data %>% 
+    drop_na(lon, lat) %>%
+    mutate(cluster = kmeans_result$cluster)
+  
+  return(data_clean)
+}
+
+# Plot clusters on map
+plot_spatial_clusters <- function(data) {
+  
+  coast <- ne_coastline(scale = 110, returnclass = "sf")
+  
+  p <- ggplot() +
+    geom_sf(data = coast, colour = "black", size = 0.2) +
+    coord_sf(ylim = c(-60, 80), expand = FALSE) +
+    geom_point(data = data, 
+               aes(x = lon, y = lat, color = factor(cluster)), 
+               size = 0.5, alpha = 0.6) +
+    scale_color_brewer(palette = "Set1", name = "Cluster") +
+    labs(x = "", y = "", 
+         title = "Spatial Clusters of Leaf N Data (K-means, k=5)") +
+    theme_bw() +
+    theme(legend.position = "bottom")
+  
+  return(p)
+}
+
+# actually run the clustering and create the plot
+leafN_data_clustered <- spatial_clustering(df, k = 5)
+plot_spatial_clusters(leafN_data_clustered)
+
+
+```
+
+#### comments about the clustering (question 2.3.2):
+The points on the map were clustered.
+Here a brief desciption of which points are in which cluster (using color as a reference):
+- organge: North America and Pasific ocean
+- blue: mainly South America, but also points in central/North America as well as in South Africa. 
+- red: Europe, middle East and Africa
+- green: China, Asia
+- violet: Australia and South Asia
+
+We can say that some cluster make more sense than other:
+- Cluster orange, green, violet seem reaonable.
+- Some seem to contain "outliers" (as least geographically speaking), like the blue cluster with points in central/North America as well as in South Africa. 
+- Finally the red cluster is quite large and it's questionable if the "European points" make sense to be in the same cluster that the "African points". 
+
+
+
+```{r}
+# Part 3 - Plot leaf N distribution by cluster
+plot_leafN_by_cluster <- function(data) {
+  
+  p <- ggplot(data, aes(x = factor(cluster), y = leafN, fill = factor(cluster))) +
+    geom_boxplot() +
+    scale_fill_brewer(palette = "Set1", name = "Cluster") +
+    labs(x = "Cluster", y = "Leaf N (mg/g)",
+         title = "Distribution of Leaf N by Spatial Cluster") +
+    theme_bw() +
+    theme(legend.position = "none")
+  
+  return(p)
+}
+# actually ee HOW leaf N differs between the different clusters
+plot_leafN_by_cluster(leafN_data_clustered)
+
+```
+
+#### comments about the leaf N cluters (question 2.3.3):
+General comments:
+- median: most of the median values are kind of similar across the clusters, only the red and especailly the violet ones are a bit lower.
+- outliers: all the clusters have quite a lot if points considered to be outlier (according to box-plot definition). Only the violet one show a bit less outliers that the other 4 clusters.
+- span: the IQR-boxes have more or less the same span, exept for the red one that is about half the size of the other ones. 
+
+
+
+```{r}
+# Part 4 - Spatial cross-validation function
+spatial_cv <- function(data, k = 5) {
+  
+  # Add spatial clusters
+  data_clustered <- spatial_clustering(data, k = k)
+  
+  # Prepare data
+  data_clean <- data_clustered %>%
+    select(leafN, elv, mat, map, ndep, mai, Species, cluster) %>%
+    drop_na()
+  
+  # Create fold indices
+  group_folds_train <- map(
+    seq(length(unique(data_clean$cluster))),
+    ~ {
+      data_clean %>%
+        select(cluster) %>%
+        mutate(idx = row_number()) %>%
+        filter(cluster != .x) %>%
+        pull(idx)
+    }
+  )
+  
+  group_folds_test <- map(
+    seq(length(unique(data_clean$cluster))),
+    ~ {
+      data_clean %>%
+        select(cluster) %>%
+        mutate(idx = row_number()) %>%
+        filter(cluster == .x) %>%
+        pull(idx)
+    }
+  )
+  
+  # Function to train and test on each fold
+  train_test_by_fold <- function(idx_train, idx_test) {
+    
+    # Split data
+    train_data <- data_clean[idx_train, ]
+    test_data <- data_clean[idx_test, ]
+    
+    # Prepare predictors and target
+    X_train <- train_data %>% select(-leafN, -cluster)
+    y_train <- train_data$leafN
+    X_test <- test_data %>% select(-leafN, -cluster)
+    y_test <- test_data$leafN
+    
+    # Train model
+    mod <- ranger(
+      x = X_train,
+      y = y_train,
+      mtry = 3,
+      min.node.size = 12,
+      num.trees = 500
+    )
+    
+    # Predict
+    pred <- predict(mod, data = X_test)$predictions
+    
+    # Calculate metrics
+    metrics <- calc_metrics(y_test, pred)
+    
+    return(metrics)
+  }
+  
+  # Apply function on each fold
+  results <- map2_dfr(
+    group_folds_train,
+    group_folds_test,
+    ~ train_test_by_fold(.x, .y)
+  ) %>%
+    mutate(test_fold = 1:k)
+  
+  return(list(results = results, data = data_clustered))
+}
+
+# Run spatial cross-validation
+spatial_results <- spatial_cv(dfs, k = 5)
+
+# show the results as a nice table:
+kable(spatial_results$results, 
+      digits = 3,
+      caption = "Spatial CV: Metrics per fold")
+
+# and after this let's calculate the mean across the 5 folds:
+spatial_summary <- spatial_results$results %>% 
+  summarise(
+    mean_rmse = mean(rmse),
+    mean_rsq = mean(rsq)
+  )
+
+print("Mean across all folds:")
+print(spatial_summary)
+
+```
+
+
+```{r}
+#Vizualisation of the chunk above
+#helps show if spatial autocorrelation inflates the random CV performance
+
+# Combine results for comparison
+comparison <- bind_rows(
+  results %>% mutate(cv_type = "Random CV"),
+  spatial_results$results %>% mutate(cv_type = "Spatial CV")
+)
+
+# do the mean before plotig
+means <- comparison %>%
+  group_by(cv_type) %>%
+  summarise(
+    mean_rmse = mean(rmse),
+    mean_rsq = mean(rsq)
+  )
+means_long <- means %>%
+  pivot_longer(cols = c(mean_rmse, mean_rsq), 
+               names_to = "metric", 
+               values_to = "mean_value") %>%
+  mutate(metric = case_when(
+    metric == "mean_rmse" ~ "rmse",
+    metric == "mean_rsq" ~ "rsq"
+  ))
+
+# Plot comparison - RMSE only
+
+ggplot(comparison, aes(x = cv_type, y = rmse, fill = cv_type)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.1, alpha = 0.5) +
+  geom_jitter(width = 0.1, alpha = 0.7, size = 2) +
+  geom_point(data = means, aes(y = mean_rmse), 
+             color = "red", size = 4, shape = 18) +
+  labs(title = "Random CV vs Spatial CV Performance",
+       subtitle = "Red diamonds = mean across folds",
+       x = "", y = "RMSE") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+# Side-by-side comparison - both metrics
+comparison_long <- comparison %>%
+  pivot_longer(cols = c(rmse, rsq), names_to = "metric", values_to = "value")
+
+ggplot(comparison_long, aes(x = cv_type, y = value, fill = cv_type)) +
+  geom_boxplot(alpha = 0.5) +
+  geom_jitter(width = 0.1, alpha = 0.7, size = 2) +  
+  geom_point(data = means_long, aes(y = mean_value), 
+             color = "red", size = 4, shape = 18) +  
+  facet_wrap(~metric, scales = "free_y", 
+             labeller = labeller(metric = c(rmse = "RMSE", rsq = "R²"))) +
+  labs(title = "Random CV vs Spatial CV: RMSE and R²",
+       subtitle = "Red diamonds = mean across 5 folds, points = individual folds",
+       x = "", y = "Value") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+# summary table to get one more overview
+kable(means, digits = 3, 
+      col.names = c("CV Type", "Mean RMSE", "Mean R²"))
+
+```
+
+#### Comment about the boxplot representation (question 2.3.4)
+
+For a better understanding of the figure above:
+- The individual points in dark grey are the 5 individual fold results.
+- That box plot show the distribution of the 5 folds.
+- The red diamonds shape points are the mean value across the 5 folds.
+
+So with this we can see:
+- how each of the 5 folds performed individually,
+- how is the overall mean performance,
+- how does random CV compared to Spatial CV. 
+
+
+
+
+
+```{r}
+kable(spatial_results$results, 
+      digits = 3,
+      caption = "Spatial CV: Results per fold")
+
+```
+
+### Comparison of Random vs Spatial CV (question 2.3.5)
+Let's first recall the values of the metrics obtained for the random CV:
+- RMSE: 2.348 
+- R²: of 0.789
+We see with the table just above that spatial CV shows worse performance:
+- lower R²
+- higher RMSE
+Usually this is an indication for spatial autocorrelation in the data.
+
+A reason for this difference can be that random CV overestimates model performance / overfits due to spatial autocorrelation.
+This because the point that are closer in space might tend to have similar values and nearby points are included in both training sets and test sets. 
+
+Spatial CV reflects real-world scenario in a better way. This might then be better for predicting unseen regions in the training dataset. 
+So why is the performance worse? A possible explanation can be that it is a reflect of the true predictive ability of the model when applied to unseen regions.
+The model is overfitting to local spatial patterns.
+So spatial CV is better for applications that are far from training data.
+As we saw at the beginning, the datapoints are sparse and unevenly distributed, so being able to predict far from the observation is essential for upscalling tasks. 
+
+
+
+##Environmental cross-validation (question 2.4)
+```{r}
+# environmental clustering function (simple one with juat 2 variables)
+environmental_clustering <- function(data, k = 5) {
+  set.seed(42)
+  
+  env_vars <- data %>% 
+    select(map, mat) %>% 
+    drop_na()
+  
+  env_vars_scaled <- scale(env_vars)
+  
+  kmeans_result <- kmeans(env_vars_scaled, centers = k, nstart = 25)
+  
+  data_clean <- data %>% 
+    drop_na(map, mat) %>%
+    mutate(env_cluster = kmeans_result$cluster)
+  
+  return(data_clean)
+}
+
+# Plot environmental clusters
+plot_environmental_clusters <- function(data) {
+  
+  p <- ggplot(data, aes(x = mat, y = map, color = factor(env_cluster))) +
+    geom_point(alpha = 0.6, size = 1) +
+    scale_color_brewer(palette = "Set1", name = "Cluster") +
+    labs(x = "Mean Annual Temperature (°C)", 
+         y = "Mean Annual Precipitation (mm)",
+         title = "Environmental Clusters (K-means, k=5)") +
+    theme_bw() +
+    theme(legend.position = "bottom")
+  
+  return(p)
+}
+
+# Environmental cross-validation function
+environmental_cv <- function(data, k = 5) {
+  
+  # Add environmental clusters
+  data_clustered <- environmental_clustering(data, k = k)
+  
+  # Prepare data
+  data_clean <- data_clustered %>%
+    select(leafN, elv, mat, map, ndep, mai, Species, env_cluster) %>%
+    drop_na()
+  
+  # Create fold indices (same logic as spatial CV)
+  group_folds_train <- map(
+    seq(length(unique(data_clean$env_cluster))),
+    ~ {
+      data_clean %>%
+        select(env_cluster) %>%
+        mutate(idx = row_number()) %>%
+        filter(env_cluster != .x) %>%
+        pull(idx)
+    }
+  )
+  
+  group_folds_test <- map(
+    seq(length(unique(data_clean$env_cluster))),
+    ~ {
+      data_clean %>%
+        select(env_cluster) %>%
+        mutate(idx = row_number()) %>%
+        filter(env_cluster == .x) %>%
+        pull(idx)
+    }
+  )
+  
+  # Function to train and test on each fold
+  train_test_by_fold <- function(idx_train, idx_test) {
+    
+    # Split data
+    train_data <- data_clean[idx_train, ]
+    test_data <- data_clean[idx_test, ]
+    
+    # Prepare predictors and target
+    X_train <- train_data %>% select(-leafN, -env_cluster)
+    y_train <- train_data$leafN
+    X_test <- test_data %>% select(-leafN, -env_cluster)
+    y_test <- test_data$leafN
+    
+    # Train model
+    mod <- ranger(
+      x = X_train,
+      y = y_train,
+      mtry = 3,
+      min.node.size = 12,
+      num.trees = 500
+    )
+    
+    # Predict
+    pred <- predict(mod, data = X_test)$predictions
+    
+    # Calculate metrics
+    metrics <- calc_metrics(y_test, pred)
+    
+    return(metrics)
+  }
+  
+  # Apply function on each fold
+  results <- map2_dfr(
+    group_folds_train,
+    group_folds_test,
+    ~ train_test_by_fold(.x, .y)
+  ) %>%
+    mutate(test_fold = 1:k)
+  
+  return(list(results = results, data = data_clustered))
+}
+
+# 1. Create environmental clusters and visualize them
+leafN_data_env <- environmental_clustering(dfs, k = 5)
+
+# 2. Plot environmental clusters (to then visualize)
+plot_environmental_clusters(leafN_data_env)
+
+# 3. Run environmental CV
+env_results <- environmental_cv(dfs, k = 5)
+
+# 4. Show individual fold results 
+kable(env_results$results, 
+      digits = 3,
+      caption = "Environmental CV: Results per fold")
+
+# 5. Show mean across folds
+env_summary <- env_results$results %>% 
+  summarise(
+    mean_rmse = mean(rmse),
+    sd_rmse = sd(rmse),
+    mean_rsq = mean(rsq),
+    sd_rsq = sd(rsq)
+  )
+
+kable(env_summary, digits = 3)
+
+# 6. Compare all three methods
+comparison_table <- tibble(
+  Method = c("Random CV", "Spatial CV", "Environmental CV"),
+  Mean_RMSE = c(
+    mean(results$rmse),
+    mean(spatial_results$results$rmse),
+    mean(env_results$results$rmse)
+  ),
+  SD_RMSE = c(
+    sd(results$rmse),
+    sd(spatial_results$results$rmse),
+    sd(env_results$results$rmse)
+  ),
+  Mean_Rsq = c(
+    mean(results$rsq),
+    mean(spatial_results$results$rsq),
+    mean(env_results$results$rsq)
+  ),
+  SD_Rsq = c(
+    sd(results$rsq),
+    sd(spatial_results$results$rsq),
+    sd(env_results$results$rsq)
+  )
+)
+
+kable(comparison_table, 
+      digits = 3, 
+      align = "c",
+      caption = "Comparison of all CV methods")
+
+# 7. Visualize comparison 
+comparison_all <- bind_rows(
+  results %>% mutate(cv_type = "Random CV"),
+  spatial_results$results %>% mutate(cv_type = "Spatial CV"),
+  env_results$results %>% mutate(cv_type = "Environmental CV")
+)
+
+# RMSE comparison
+ggplot(comparison_all, aes(x = cv_type, y = rmse, fill = cv_type)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.1, alpha = 0.5) +
+  labs(title = "Comparison of CV Methods",
+       x = "", y = "RMSE") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Both metrics comparison
+comparison_all_long <- comparison_all %>%
+  pivot_longer(cols = c(rmse, rsq), names_to = "metric", values_to = "value")
+
+ggplot(comparison_all_long, aes(x = cv_type, y = value, fill = cv_type)) +
+  geom_boxplot() +
+  facet_wrap(~metric, scales = "free_y",
+             labeller = labeller(metric = c(rmse = "RMSE", rsq = "R²"))) +
+  labs(title = "All CV Methods: RMSE and R²",
+       x = "", y = "Value") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+#### comments about the plots and table
+In the first plot we see the environmental clusters based on the men annual temperature and the mean annual precipitation.
+We see that the clusters are quite close to each other. The orange one is has quite spared observations. It's also the only cluster that isn't totally touching another cluster.
+For the blue/green/red/violet clusters, it seems that some observations where arbitrary put in one cluster, even though they are just at the limit of belonging to another cluster. This might have an influence in the CV. 
+ 
+The third displayed table compares the three CV methods. We see that:
+- random CV has the lower mean RMSE, the higher R² and also the lowest SD across folds' RMSE
+- this might be because nearby environmentally similar samples were included in both training set and testing set.
+
+
+- spatial CV has the bigest mean RSME and also the biggest SD of the folds' RMSE, as well as the lowest R²
+- But this method ensure geografic independence!
+- So it's more realistic that random CV but doesn't account for any environmental component, only for the geographical distribution
+- coming back to the maps where the observation points are displaey, we can see the problem as some regions are observed and other are not observed at all!
+
+- environmental CV has a performance that is between the random and the spatial CV.
+- we can interpret that the environmental similarity play a role for the autocorrelation in leaf N.
+
+
+## key take-away of this report:
+These results highlight that traditional random CV overestimates predictive ability when spatial or environmental structure exists.
+Environmental CV makes the more sense for this kind of upscaling problem, but the training dataset should cover the full environmental gradient to get good results
+The geographical distances doesn't necessary say much about the environmental situation, especially if the observations are sparse and not equally distributed around the world.  
+
+
